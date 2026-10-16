@@ -83,7 +83,25 @@ fn find_pair(
     let pos = doc.char_to_byte(pos_) as u32;
 
     let root = syntax.tree_for_byte_range(pos, pos).root_node();
-    let mut node = root.descendant_for_byte_range(pos, pos)?;
+    // When the cursor is on a bracket, seed the climb from the node covering
+    // the bracket char itself instead of from the node covering the empty
+    // range at the cursor. An empty range can be hijacked by a zero-width
+    // node at the same position: tree-sitter descends into the invisible
+    // node (e.g. Typst's `_immediate_paren` / `_immediate_brack` external
+    // scanner tokens, which accept without advancing) and then stops,
+    // returning an ancestor such as the enclosing `call` instead of the
+    // bracket token. From that ancestor the climb never reaches the pair
+    // and the leaf-only plaintext fallback also bails out, so `mm` and
+    // highlighting both report no match. A one-byte range skips zero-width
+    // nodes (their end is before the range end) and lands on the bracket
+    // token. For cursor positions that are not on a bracket the empty
+    // range is kept, preserving the fuzzy inside-scope behaviour.
+    let seed_end = if pos_ < doc.len_chars() && is_valid_pair(doc.char(pos_)) {
+        pos + 1
+    } else {
+        pos
+    };
+    let mut node = root.descendant_for_byte_range(pos, seed_end)?;
 
     loop {
         if node.is_named() && node.child_count() >= 2 {
@@ -321,6 +339,50 @@ mod tests {
     fn find_matching_bracket_empty_file() {
         let actual = find_matching_bracket_plaintext("".into(), 0);
         assert_eq!(actual, None);
+    }
+
+    #[test]
+    fn test_find_matching_bracket_fuzzy_typst_16378() {
+        // Regression test for helix-editor/helix#16378: `mm` (goto matching
+        // bracket) must move when the cursor is on the opening `(` of a
+        // Typst call or on the `[` opening a content block, matching the
+        // bracket highlighting (non-fuzzy) result.
+        use std::sync::LazyLock;
+
+        use crate::Syntax;
+
+        static LOADER: LazyLock<crate::syntax::Loader> =
+            LazyLock::new(crate::config::default_lang_loader);
+
+        let source = crate::Rope::from_str(
+            "#rect(width: 100%, height: 1fr, inset: 5mm, stroke: stroke(dash: \"dash-dotted\", thickness: 2pt), radius: 5mm)[\n\n]\n",
+        );
+        let language = LOADER.language_for_name("typst").unwrap();
+        let syntax = Syntax::new(source.slice(..), language, &LOADER).unwrap();
+        let doc = source.slice(..);
+
+        // Cursor on the first `(` (char 5) -> matching `)` (char 108).
+        assert_eq!(
+            find_matching_bracket_fuzzy(&syntax, doc, 5),
+            Some(108),
+            "TEMP fuzzy-only check for `(`"
+        );
+        assert_eq!(
+            find_matching_bracket_fuzzy(&syntax, doc, 5),
+            Some(108),
+            "mm (fuzzy) must find the match for `(`"
+        );
+        // Cursor on the `[` (char 109) -> matching `]` (char 112).
+        assert_eq!(
+            find_matching_bracket(&syntax, doc, 109),
+            Some(112),
+            "highlight (non-fuzzy) must find the match for `[`"
+        );
+        assert_eq!(
+            find_matching_bracket_fuzzy(&syntax, doc, 109),
+            Some(112),
+            "mm (fuzzy) must find the match for `[`"
+        );
     }
 
     #[test]
